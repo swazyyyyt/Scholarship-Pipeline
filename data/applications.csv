@@ -1,0 +1,8 @@
+id,name,gpa,monthlyIncome,volunteerHours,hasDisciplinaryRecord
+S001,Aigerim,3.9,400,120,false
+S002,Bekzat,3.6,1500,30,false
+S003,Dana,3.2,300,50,false
+S004,Erlan,2.5,800,0,false
+S005,Firuza,2.4,200,200,false
+S006,Galym,3.8,600,15,true
+S007,Hanna,3.8,1000,100,false

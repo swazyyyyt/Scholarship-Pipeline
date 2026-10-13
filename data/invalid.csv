@@ -1,0 +1,9 @@
+id,name,gpa,monthlyIncome,volunteerHours,hasDisciplinaryRecord
+S101,Valid Student,3.4,700,20,false
+S102,Bad Gpa,abc,700,20,false
+S103,Gpa Too High,4.5,700,20,false
+S104,Negative Income,3.0,-5,20,false
+S105,Missing Hours,3.0,700,,false
+S106,Bad Flag,3.0,700,20,maybe
+S107,Too Few Fields,3.0,700
+S101,Duplicate,3.0,700,20,false
