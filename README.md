@@ -1,8 +1,140 @@
 # Scholarship Application Scoring Pipeline
 
-Assignment 5 - Composing Functions Using Pipelining (Introduction to Functional Programming, 2026-2027)
+Assignment 6 - Handling Temporal Coupling (Introduction to Functional Programming, 2026-2027).
+The project is the same runnable project as Assignment 5, extended with a validated factory, explicit states and safe transitions.
 
-## Task 1 - Workflow definition
+- **Team:** individual work. Yerkinbek Alikhan, IT-2505 - all logic, tests and documentation.
+- **Workflow:** scholarship committee screens applications, ranks them with a bonus policy and finalizes the awards.
+- **Input:** CSV `id, name, gpa, monthlyIncome, volunteerHours, hasDisciplinaryRecord` (`data/applications.csv`).
+- **Domain rules:** eligible = `gpa >= 2.5` (inclusive), `0 <= gpa <= 4`, income >= 0, hours >= 0, id/name not blank, no disciplinary record. Score = `round(gpa*20) + min(hours/10, 10) + bonus` (need-based or merit-based). Top 3 are awarded.
+- **Output:** ineligible applications with reasons, then ranking, awards and average score per policy.
+
+## Task 1 - Hidden dependency (UNSAFE example, documentation only - not in the project)
+
+Operation: **finalize the awards**. Hidden prerequisites: applications must be screened (eligibility), then scored/ranked, and only then finalized.
+
+```csharp
+// UNSAFE "before" version (NOT part of the application)
+class Round {
+    public List<ScholarshipApplication> Applications = new();   // anyone can add raw data
+    public List<Recommendation> Ranking = new();                // empty until Rank() is called
+    public bool Finalized;
+    public void Screen()   { Applications.RemoveAll(a => a.Gpa < 2.5m || a.HasDisciplinaryRecord); }
+    public void Rank()     { /* fills Ranking from Applications */ }
+    public void Finalize() { Finalized = true; }                // never checks anything
+}
+var r = new Round { Applications = { new("S006","Galym",3.8m,600,15,true) } };
+r.Finalize();               // order wrong: Rank() and Screen() were never called
+// r.Finalized == true, Ranking is empty, the disciplined student is still in Applications
+r.Rank();                   // called after Finalize or without Screen(): S006 is ranked and can be awarded
+r.Rank(); r.Rank();         // repeated call silently recomputes / duplicates work
+```
+
+**Order:** Screen -> Rank -> Finalize. **What goes wrong:** Finalize succeeds with no ranking (an "invalid confirmation": nobody is awarded but the round is closed); skipping Screen lets a student with a disciplinary record or gpa 2.4 get a scholarship; calling in another order or repeating changes the result.
+
+**Safe version (this project):** the order is carried by types. `Rank` needs a `RoundState.Collected` built from `EligibleApplication` values; `Finalize` on a state that is not ranked is refused; unchecked applications cannot reach scoring at all.
+
+## Task 2 - Validated factory (`Eligibility.cs`)
+
+- `EligibleApplication.Create(ScholarshipApplication, decimal minGpa)` returns `EligibilityOutcome` (Eligible with the value, or Ineligible with ALL reasons). Checks: gpa range, gpa >= minimum (inclusive), no disciplinary record, income >= 0, hours >= 0, id and name not blank. Invalid `minGpa` throws `ArgumentOutOfRangeException` (programmer error, not data error).
+- **Access restriction:** `EligibleApplication` is a `sealed class` with a **private constructor** and a **get-only** property. It is deliberately not a `record`, so there is no public `with` copy that could skip the checks. The only way to get one is `Create`. A reflection test enforces this.
+- **Used by the real workflow:** `Stages.Screen` (stage 1) calls the factory for every application; `Stages.ScoreApplications` and `ScoredApplication` accept only `EligibleApplication`; `AwardRound.Open` uses `Screen`.
+- Parsing (`ApplicationCsvParser`) still checks the text format (numbers, flags, duplicates); the factory checks the domain rules.
+
+## Task 3 - Distinct cases (closed record hierarchies; constructors are private so no extra case can be added)
+
+| Type | Cases | Meaning / payload |
+|------|-------|-------------------|
+| `EligibilityOutcome` | `Eligible(EligibleApplication Value)` | passed all rules; carries the validated value |
+| | `Ineligible(ImmutableArray<string> Reasons)` | failed; carries only the reasons |
+| `RoundState` | `Collected(Eligible, Rejected)` | screened, not ranked |
+| | `Ranked(Result, Rejected)` | ranking computed |
+| | `Finalized(Result, Rejected)` | awards are final |
+| `TransitionOutcome` | `Accepted(RoundState Next)` / `Refused(string Reason)` | next state or a clear refusal |
+
+## Task 4 - Pattern matching in the real path
+
+- `Stages.Screen`: `switch` over `EligibilityOutcome` (Eligible -> eligible list, Ineligible -> rejection with reasons, default throws).
+- `AwardRound.Rank` / `Finalize` / `RejectionsOf`: `switch` expressions over `RoundState` with every case handled explicitly; the `_` branch only refuses.
+- `RoundStore.Apply` and `Program.cs`: `switch` over `TransitionOutcome` / the current state. No casts, no `!`.
+
+## Task 5 - Safe operations (`AwardRound.cs`)
+
+| Call | Result |
+|------|--------|
+| `Open` -> `Rank` -> `Finalize` | success: `Collected` -> `Ranked` -> `Finalized` |
+| `Finalize` on `Collected` (missing prerequisite / wrong order) | `Refused("must be ranked before ...")` |
+| `Rank` with negative award slots (invalid input) | `Refused("Award slots must not be negative")` |
+| `Rank` again (repeat) | `Refused("already ranked")`; ranking is not replaced |
+| `Finalize` again (repeat) | `Accepted` with the **same** state object (documented idempotent rule) |
+
+Transitions are pure: they take a state and return a new state; nothing is mutated. `RoundStore` is the only mutable holder (boundary): it computes the outcome first and stores the new state only when it is `Accepted`; a refusal or an exception leaves the stored state untouched.
+Compile-time prevention: `Stages.ScoreApplications` cannot be called with an unchecked `ScholarshipApplication` (it needs `EligibleApplication`); such a call is not included in the code because it does not compile.
+
+## Requirement map
+
+| Requirement | Files / methods |
+|-------------|-----------------|
+| Hidden dependency before/after | this README (Task 1) |
+| Validated factory, used by the app | `Eligibility.cs` `EligibleApplication.Create`; `Stages.Screen`; `AwardRound.Open` |
+| Prevent unchecked construction | private constructor, sealed class, get-only property |
+| Distinct cases | `EligibilityOutcome`, `RoundState`, `TransitionOutcome` |
+| Pattern matching | `Stages.Screen`, `AwardRound.*`, `RoundStore.Apply`, `Program.cs` |
+| Safe operations / repeated rule | `AwardRound.Rank`, `AwardRound.Finalize`, `RoundStore.Apply` |
+| Functional separation | pure `Stages`/`AwardRound`; I/O only in `Program.cs` |
+| Tests | `tests/ScholarshipPipeline.Tests/WorkflowTests.cs` |
+
+## How to build, run and test
+
+- **.NET SDK 8.0** (`dotnet --version`; the projects use `RollForward=Major`). Internet is needed on the first build to restore xUnit from NuGet.
+- **Working directory:** the folder containing `ScholarshipPipeline.sln`.
+
+```
+dotnet build
+dotnet run --project src/ScholarshipPipeline -- data/applications.csv both     # normal run
+dotnet run --project src/ScholarshipPipeline -- data/applications.csv demo     # invalid sequence, invalid input, repeated call
+dotnet run --project src/ScholarshipPipeline -- data/invalid.csv both          # parse failures
+dotnet test
+```
+
+Expected normal run: `NOT ELIGIBLE: S005 - gpa 2.4 is below the minimum 2.5`, `NOT ELIGIBLE: S006 - has a disciplinary record`, then the need-based and merit-based tables from Assignment 5 (S001, S007, S003 / S001, S007, S002 awarded; averages 85.60 / 83.60).
+
+Expected `demo` run:
+
+```
+1. Finalize before Rank   : REFUSED: The round must be ranked before it can be finalized.
+2. Rank with -1 slots     : REFUSED: Award slots must not be negative (got -1).
+   state still unchanged  : True
+3. Rank (valid)           : ACCEPTED -> Ranked
+4. Rank again             : REFUSED: The round is already ranked; finalize it.
+5. Finalize               : ACCEPTED -> Finalized
+6. Finalize again         : ACCEPTED -> Finalized (same state: True)
+```
+
+## Tests (xUnit, `dotnet test`)
+
+| Required case | Tests |
+|---------------|-------|
+| Factory success | `Factory_ValidInput_CreatesUsableValidatedValue` |
+| Factory rejection | `Factory_EachRule_RejectsInvalidInputAndReportsReason` (5 rules), `Factory_BlankId_...`, `Factory_InvalidMinGpaOrNullInput_Throws`, `Factory_NoPublicConstructors_AndGetOnlyProperties` |
+| Distinct cases | `DistinctCases_BothCasesReachable_...`, `Screening_SplitsApplications...`, `RoundStates_AllThreeCasesAreReachable` |
+| Normal operation | `NormalOperation_OpenRankFinalize_GivesDocumentedAwards` + A5 workflow tests |
+| Missing prerequisite | `MissingPrerequisite_FinalizeBeforeRank_IsRefused`, `InvalidInput_NegativeAwardSlots_IsRefused` |
+| Repeated operation | `RepeatedOperation_RankTwiceIsRefused_FinalizeTwiceReturnsSameState` |
+| Boundary value | `Boundary_Factory_...` (2.5 / 4.0 / 2.49), `Boundary_Transition_ZeroAwardSlots...` + A5 boundary tests |
+| State preservation | `StatePreservation_FailedTransitionsLeaveStateAndStoreUnchanged`, `StatePreservation_FailedConstruction_DoesNotChangeInputList` |
+
+**Latest test outcome:** all 55 test cases (A5 + A6) passed, 0 failed. Note: this was checked in an offline environment with a small assertion runner because NuGet was unreachable; please run `dotnet test` once on your machine and update this line with the real xUnit count.
+
+## Contributions
+
+- Yerkinbek Alikhan, IT-2505 - individual project: factory, states, transitions, tests, documentation.
+
+---
+
+# Background: Assignment 5 documentation (still valid)
+
+### A5 Task 1 - Workflow definition
 
 - **Topic:** scoring scholarship applications and recommending who receives a scholarship.
 - **Intended users:** a university scholarship committee.
@@ -40,7 +172,7 @@ Assignment 5 - Composing Functions Using Pipelining (Introduction to Functional 
 - Merit-based ranking: S001, S007, S002, S003, S004; awarded: S001, S007, **S002**; average 83.60.
 - The policy changes who gets the third scholarship (S003 vs S002); the pipeline code is identical.
 
-## Task 2 - Models and validation
+### A5 Task 2 - Models and validation
 
 - Immutable `record`s in `src/ScholarshipPipeline/Models.cs`: `ScholarshipApplication`, `ScoredApplication`, `Recommendation`, `ScholarshipResult`, `PipelineSettings`, `ParseReport`.
 - Results expose `ImmutableArray<T>` (a real immutable copy, not a mutable list behind `IReadOnlyList`).
@@ -48,7 +180,7 @@ Assignment 5 - Composing Functions Using Pipelining (Introduction to Functional 
 - `null` input -> `ArgumentNullException` (missing); header only -> valid empty dataset; no header at all -> error; `0` and `false` are valid values.
 - Limitation: CSV fields cannot contain commas or quotes.
 
-## Task 3 - Stages (`Stages.cs`, composed in `ScholarshipWorkflow.Run`)
+### A5 Task 3 - Stages (`Stages.cs`, composed in `ScholarshipWorkflow.Run`)
 
 | Stage | Input -> Output | Rule | Example |
 |-------|-----------------|------|---------|
@@ -58,17 +190,17 @@ Assignment 5 - Composing Functions Using Pipelining (Introduction to Functional 
 
 Trace of S003 (Dana, gpa 3.2, income 300, 50 h), need-based: parsed -> `ScholarshipApplication` -> passes stage 1 (3.2 >= 2.5) -> stage 2: 64 + 5 + 20 = `ScoredApplication(S003, 89)` -> stage 3: rank 3, `Recommendation(3, "S003", "Dana", 89, Awarded: true)`.
 
-## Task 4 - Configurable rule
+### A5 Task 4 - Configurable rule
 
 - Higher-order function: `Stages.ScoreApplications(eligible, Func<ScholarshipApplication,int> bonusPolicy)`; the delegate is invoked in `.Select(a => ... + bonusPolicy(a))`.
 - Policies: `BonusPolicies.NeedBased` and `BonusPolicies.MeritBased`.
 - The policy is chosen in `Program.cs` (`SelectPolicies`) and passed as an argument to `ScholarshipWorkflow.Run`. No global mutable setting exists.
 
-## Task 5 - Purity
+### A5 Task 5 - Purity
 
 Stages and `ScholarshipWorkflow.Run` never read the console, write files, use a clock/random value or touch static mutable state, and never modify the caller's collection. File reading and printing live only in `Program.cs`; `ResultFormatter` is a pure function that returns a string.
 
-## Requirement map
+### A5 Requirement map
 
 | Requirement | Where |
 |-------------|-------|
@@ -80,7 +212,7 @@ Stages and `ScholarshipWorkflow.Run` never read the console, write files, use a 
 | I/O separated from core | `Program.cs`, `ResultFormatter.cs` |
 | Tests | `tests/ScholarshipPipeline.Tests/WorkflowTests.cs` |
 
-## How to build, run and test
+### A5 build notes
 
 - Prerequisite: .NET SDK 8.0 or newer (`dotnet --version`). Packages are restored from NuGet (internet needed on first build).
 - Working directory: the folder that contains `ScholarshipPipeline.sln`.
@@ -122,7 +254,7 @@ Rank  Id    Name        Score  Awarded
 Failure demo (`data/invalid.csv`): 7 lines starting with `REJECTED:` (lines 3-9), 1 valid application parsed, exit code 1.
 Empty demo (`data/empty.csv`): `Parsed 0 valid application(s).`, then `(no eligible applications)` for each policy.
 
-## Tests (xUnit, `dotnet test`)
+### A5 tests (xUnit, `dotnet test`)
 
 | Required case | Test(s) | Expected |
 |---------------|---------|----------|
@@ -135,6 +267,6 @@ Empty demo (`data/empty.csv`): `Parsed 0 valid application(s).`, then `(no eligi
 
 **Latest test outcome:** Passed: 35, Failed: 0
 
-## Team / contributions
+### A5 team
 
 - Yerkinbek Alikhan, IT-2505 - individual project: all logic, tests and documentation.

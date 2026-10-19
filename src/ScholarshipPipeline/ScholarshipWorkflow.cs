@@ -15,8 +15,8 @@ public static class ScholarshipWorkflow
             throw new ArgumentOutOfRangeException(nameof(settings), "MinGpa must be between 0 and 4.");
         ArgumentOutOfRangeException.ThrowIfNegative(settings.AwardSlots);
 
-        var eligible = Stages.SelectEligible(applications, settings.MinGpa);   // stage 1
-        var scored = Stages.ScoreApplications(eligible, bonusPolicy);          // stage 2
+        var screening = Stages.Screen(applications, settings.MinGpa);           // stage 1 (validated factory)
+        var scored = Stages.ScoreApplications(screening.Eligible, bonusPolicy); // stage 2
         return Stages.BuildResult(scored, settings.AwardSlots);                // stage 3
     }
 }

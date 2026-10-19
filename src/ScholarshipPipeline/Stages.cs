@@ -10,31 +10,40 @@ public static class Stages
     public const int MaxVolunteerPoints = 10;
 
     /// <summary>
-    /// Stage 1: IReadOnlyList&lt;ScholarshipApplication&gt; -> ImmutableArray&lt;ScholarshipApplication&gt;.
-    /// Keeps applications with Gpa &gt;= minGpa (inclusive) and no disciplinary record.
+    /// Stage 1: IReadOnlyList&lt;ScholarshipApplication&gt; -> ScreeningResult.
+    /// Every application goes through the factory EligibleApplication.Create; the outcome is matched explicitly.
     /// </summary>
-    public static ImmutableArray<ScholarshipApplication> SelectEligible(
-        IReadOnlyList<ScholarshipApplication> applications, decimal minGpa)
+    public static ScreeningResult Screen(IReadOnlyList<ScholarshipApplication> applications, decimal minGpa)
     {
         ArgumentNullException.ThrowIfNull(applications);
-        return applications
-            .Where(a => a.Gpa >= minGpa && !a.HasDisciplinaryRecord)
-            .ToImmutableArray();
+        var eligible = ImmutableArray.CreateBuilder<EligibleApplication>();
+        var rejected = ImmutableArray.CreateBuilder<Rejection>();
+
+        foreach (var application in applications)
+        {
+            switch (EligibleApplication.Create(application, minGpa))
+            {
+                case EligibilityOutcome.Eligible e: eligible.Add(e.Value); break;
+                case EligibilityOutcome.Ineligible i: rejected.Add(new Rejection(application.Id, i.Reasons)); break;
+                default: throw new InvalidOperationException("Unknown eligibility outcome.");
+            }
+        }
+        return new ScreeningResult(eligible.ToImmutable(), rejected.ToImmutable());
     }
 
     /// <summary>
-    /// Stage 2: IReadOnlyList&lt;ScholarshipApplication&gt; + Func -> ImmutableArray&lt;ScoredApplication&gt;.
+    /// Stage 2: IReadOnlyList&lt;EligibleApplication&gt; + Func -> ImmutableArray&lt;ScoredApplication&gt;.
     /// Higher-order function: calls bonusPolicy once per application.
     /// Score = round(Gpa * 20) + min(VolunteerHours / 10, 10) + bonusPolicy(application).
     /// </summary>
     public static ImmutableArray<ScoredApplication> ScoreApplications(
-        IReadOnlyList<ScholarshipApplication> eligible,
+        IReadOnlyList<EligibleApplication> eligible,
         Func<ScholarshipApplication, int> bonusPolicy)
     {
         ArgumentNullException.ThrowIfNull(eligible);
         ArgumentNullException.ThrowIfNull(bonusPolicy);
         return eligible
-            .Select(a => new ScoredApplication(a, BaseScore(a) + VolunteerPoints(a) + bonusPolicy(a)))
+            .Select(a => new ScoredApplication(a, BaseScore(a.Application) + VolunteerPoints(a.Application) + bonusPolicy(a.Application)))
             .ToImmutableArray();
     }
 
@@ -49,10 +58,10 @@ public static class Stages
 
         var ranking = scored
             .OrderByDescending(s => s.Score)
-            .ThenByDescending(s => s.Application.Gpa)
-            .ThenBy(s => s.Application.Id, StringComparer.Ordinal)
+            .ThenByDescending(s => s.Candidate.Gpa)
+            .ThenBy(s => s.Candidate.Id, StringComparer.Ordinal)
             .Select((s, index) => new Recommendation(
-                index + 1, s.Application.Id, s.Application.Name, s.Score, index < awardSlots))
+                index + 1, s.Candidate.Id, s.Candidate.Name, s.Score, index < awardSlots))
             .ToImmutableArray();
 
         var average = scored.Count == 0

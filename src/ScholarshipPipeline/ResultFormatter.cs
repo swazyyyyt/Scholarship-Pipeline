@@ -27,4 +27,13 @@ public static class ResultFormatter
             sb.AppendLine($"{r.Rank,-5} {r.Id,-5} {r.Name,-11} {r.Score,-6} {(r.Awarded ? "yes" : "no")}");
         return sb.ToString();
     }
+
+    public static string FormatRejections(IEnumerable<Rejection> rejected)
+    {
+        ArgumentNullException.ThrowIfNull(rejected);
+        var sb = new StringBuilder();
+        foreach (var r in rejected)
+            sb.AppendLine($"NOT ELIGIBLE: {r.Id} - {string.Join("; ", r.Reasons)}");
+        return sb.ToString();
+    }
 }

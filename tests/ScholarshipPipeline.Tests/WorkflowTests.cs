@@ -22,6 +22,14 @@ public class WorkflowTests
         string id, decimal gpa = 3.0m, decimal income = 2000m, int hours = 0, bool disciplinary = false) =>
         new(id, "Name " + id, gpa, income, hours, disciplinary);
 
+    private static EligibleApplication Elig(
+        string id, decimal gpa = 3.0m, decimal income = 2000m, int hours = 0) =>
+        EligibleApplication.Create(App(id, gpa, income, hours), 0m) switch
+        {
+            EligibilityOutcome.Eligible e => e.Value,
+            _ => throw new InvalidOperationException("test helper: application should be eligible")
+        };
+
     private static string[] Ids(IEnumerable<Recommendation> rs) => rs.Select(r => r.Id).ToArray();
     private static int[] Scores(IEnumerable<Recommendation> rs) => rs.Select(r => r.Score).ToArray();
     private static string[] AwardedIds(ScholarshipResult r) => r.Ranking.Where(x => x.Awarded).Select(x => x.Id).ToArray();
@@ -95,7 +103,7 @@ public class WorkflowTests
     public void Boundary_GpaExactlyMinimum_IsIncluded()
     {
         var apps = new[] { App("at", gpa: 2.5m), App("below", gpa: 2.49m) };
-        var eligible = Stages.SelectEligible(apps, 2.5m);
+        var eligible = Stages.Screen(apps, 2.5m).Eligible;
         Assert.Equal(new[] { "at" }, eligible.Select(a => a.Id).ToArray());
     }
 
@@ -119,7 +127,7 @@ public class WorkflowTests
     [Fact]
     public void Boundary_AwardSlots_ZeroAndMoreThanCandidates()
     {
-        var scored = Stages.ScoreApplications(new[] { App("a"), App("b") }, _ => 0);
+        var scored = Stages.ScoreApplications(new[] { Elig("a"), Elig("b") }, _ => 0);
         Assert.Equal(0, Stages.BuildResult(scored, 0).AwardedCount);
         Assert.Equal(2, Stages.BuildResult(scored, 10).AwardedCount);
     }
@@ -217,7 +225,7 @@ public class WorkflowTests
     public void Stage1_ReturnsIndependentCopy_AndDropsIneligible()
     {
         var list = SampleApplications().ToList();
-        var eligible = Stages.SelectEligible(list, 2.5m);
+        var eligible = Stages.Screen(list, 2.5m).Eligible;
 
         Assert.Equal(new[] { "S001", "S002", "S003", "S004", "S007" }, eligible.Select(a => a.Id).ToArray());
         list.Clear();                                                  // caller changes its own list later
@@ -228,7 +236,7 @@ public class WorkflowTests
     public void Stage2_CallsDelegateOncePerApplication_AndAddsItsBonus()
     {
         var calls = 0;
-        var input = new[] { App("a", gpa: 3.0m, hours: 25), App("b", gpa: 3.0m, hours: 25) };
+        var input = new[] { Elig("a", gpa: 3.0m, hours: 25), Elig("b", gpa: 3.0m, hours: 25) };
 
         var scored = Stages.ScoreApplications(input, _ => { calls++; return 7; });
 
@@ -242,16 +250,16 @@ public class WorkflowTests
     {
         var scored = new[]
         {
-            new ScoredApplication(App("B", gpa: 3.0m), 50),
-            new ScoredApplication(App("A", gpa: 3.0m), 50),
-            new ScoredApplication(App("C", gpa: 3.5m), 50),
+            new ScoredApplication(Elig("B", gpa: 3.0m), 50),
+            new ScoredApplication(Elig("A", gpa: 3.0m), 50),
+            new ScoredApplication(Elig("C", gpa: 3.5m), 50),
         };
 
         var result = Stages.BuildResult(scored, 2);
 
         Assert.Equal(new[] { "C", "A", "B" }, Ids(result.Ranking));
         Assert.Equal(new[] { "C", "A" }, AwardedIds(result));
-        Assert.Equal("B", scored[0].Application.Id);                   // input order unchanged
+        Assert.Equal("B", scored[0].Candidate.Id);                   // input order unchanged
         Assert.Equal(50m, result.AverageScore);
     }
 
@@ -265,4 +273,217 @@ public class WorkflowTests
         Assert.Contains("S001", text);
         Assert.Contains("Average score: 85.60", text);
     }
+
+    // ================= Assignment 6: validated factory, explicit cases, safe transitions =================
+
+    // ---------- FACTORY SUCCESS ----------
+    [Fact]
+    public void Factory_ValidInput_CreatesUsableValidatedValue()
+    {
+        var outcome = EligibleApplication.Create(App("S1", gpa: 3.2m, income: 300m, hours: 50), 2.5m);
+
+        var eligible = Assert.IsType<EligibilityOutcome.Eligible>(outcome);
+        Assert.Equal("S1", eligible.Value.Id);
+        Assert.Equal(3.2m, eligible.Value.Gpa);
+        Assert.Equal(50, eligible.Value.Application.VolunteerHours);
+    }
+
+    // ---------- FACTORY REJECTION (each rule) ----------
+    [Theory]
+    [InlineData(2.4, 500, 10, false, "below the minimum")]
+    [InlineData(3.0, 500, 10, true, "disciplinary")]
+    [InlineData(4.5, 500, 10, false, "between 0.0 and 4.0")]
+    [InlineData(3.0, -1, 10, false, "monthlyIncome")]
+    [InlineData(3.0, 500, -3, false, "volunteerHours")]
+    public void Factory_EachRule_RejectsInvalidInputAndReportsReason(
+        double gpa, double income, int hours, bool disciplinary, string expectedReason)
+    {
+        var raw = new ScholarshipApplication("S1", "A", (decimal)gpa, (decimal)income, hours, disciplinary);
+
+        var outcome = EligibleApplication.Create(raw, 2.5m);
+
+        var ineligible = Assert.IsType<EligibilityOutcome.Ineligible>(outcome);
+        Assert.Contains(ineligible.Reasons, r => r.Contains(expectedReason));
+    }
+
+    [Fact]
+    public void Factory_BlankId_IsRejected_AndAllReasonsAreCollected()
+    {
+        var raw = new ScholarshipApplication(" ", "A", 1.0m, 0m, 0, true);
+        var ineligible = Assert.IsType<EligibilityOutcome.Ineligible>(EligibleApplication.Create(raw, 2.5m));
+
+        Assert.Equal(3, ineligible.Reasons.Length);   // id, gpa below minimum, disciplinary record
+        Assert.Contains("id is missing", ineligible.Reasons);
+    }
+
+    [Fact]
+    public void Factory_InvalidMinGpaOrNullInput_Throws()
+    {
+        Assert.Throws<ArgumentNullException>(() => EligibleApplication.Create(null!, 2.5m));
+        Assert.Throws<ArgumentOutOfRangeException>(() => EligibleApplication.Create(App("a"), 4.1m));
+    }
+
+    // ---------- UNCHECKED CONSTRUCTION IS NOT POSSIBLE ----------
+    [Fact]
+    public void Factory_NoPublicConstructors_AndGetOnlyProperties()
+    {
+        Assert.Empty(typeof(EligibleApplication).GetConstructors());                 // only Create(...) builds one
+        Assert.True(typeof(EligibleApplication).IsSealed);
+        Assert.All(typeof(EligibleApplication).GetProperties(),
+            p => Assert.True(p.SetMethod is null, p.Name + " must be get-only"));
+        // the unions are closed: nobody outside can add a case
+        Assert.Empty(typeof(EligibilityOutcome).GetConstructors());
+        Assert.Empty(typeof(RoundState).GetConstructors());
+        Assert.Empty(typeof(TransitionOutcome).GetConstructors());
+    }
+
+    // ---------- DISTINCT CASES + PATTERN MATCHING ----------
+    [Fact]
+    public void DistinctCases_BothCasesReachable_AndMatchedExplicitly()
+    {
+        static string Match(EligibilityOutcome o) => o switch
+        {
+            EligibilityOutcome.Eligible e => "eligible:" + e.Value.Id,
+            EligibilityOutcome.Ineligible i => "ineligible:" + string.Join("|", i.Reasons),
+            _ => "unknown"
+        };
+
+        Assert.Equal("eligible:ok", Match(EligibleApplication.Create(App("ok"), 2.5m)));
+        Assert.Equal("ineligible:has a disciplinary record",
+            Match(EligibleApplication.Create(App("bad", disciplinary: true), 2.5m)));
+    }
+
+    [Fact]
+    public void Screening_SplitsApplicationsIntoEligibleAndRejectedWithReasons()
+    {
+        var screening = Stages.Screen(SampleApplications(), 2.5m);
+
+        Assert.Equal(new[] { "S001", "S002", "S003", "S004", "S007" }, screening.Eligible.Select(e => e.Id).ToArray());
+        Assert.Equal(new[] { "S005", "S006" }, screening.Rejected.Select(r => r.Id).ToArray());
+        Assert.Contains("below the minimum 2.5", Assert.Single(screening.Rejected[0].Reasons));
+        Assert.Contains("disciplinary", Assert.Single(screening.Rejected[1].Reasons));
+    }
+
+    [Fact]
+    public void RoundStates_AllThreeCasesAreReachable()
+    {
+        var collected = AwardRound.Open(SampleApplications(), 2.5m);
+        var ranked = Accepted(AwardRound.Rank(collected, BonusPolicies.NeedBased, 3));
+        var finalized = Accepted(AwardRound.Finalize(ranked));
+
+        Assert.IsType<RoundState.Collected>(collected);
+        Assert.IsType<RoundState.Ranked>(ranked);
+        Assert.IsType<RoundState.Finalized>(finalized);
+        Assert.Equal(2, AwardRound.RejectionsOf(finalized).Length);   // rejections travel with every case
+    }
+
+    // ---------- NORMAL OPERATION (validated value used by the real workflow) ----------
+    [Fact]
+    public void NormalOperation_OpenRankFinalize_GivesDocumentedAwards()
+    {
+        var store = new RoundStore(AwardRound.Open(SampleApplications(), 2.5m));
+
+        Assert.IsType<TransitionOutcome.Accepted>(store.Apply(s => AwardRound.Rank(s, BonusPolicies.NeedBased, 3)));
+        Assert.IsType<TransitionOutcome.Accepted>(store.Apply(AwardRound.Finalize));
+
+        var finalized = Assert.IsType<RoundState.Finalized>(store.Current);
+        Assert.Equal(new[] { "S001", "S007", "S003" }, AwardedIds(finalized.Result));
+        Assert.Equal(85.6m, finalized.Result.AverageScore);
+    }
+
+    // ---------- MISSING PREREQUISITE / INVALID SEQUENCE ----------
+    [Fact]
+    public void MissingPrerequisite_FinalizeBeforeRank_IsRefused()
+    {
+        var collected = AwardRound.Open(SampleApplications(), 2.5m);
+
+        var refused = Assert.IsType<TransitionOutcome.Refused>(AwardRound.Finalize(collected));
+
+        Assert.Contains("ranked before", refused.Reason);
+    }
+
+    [Fact]
+    public void InvalidInput_NegativeAwardSlots_IsRefused()
+    {
+        var collected = AwardRound.Open(SampleApplications(), 2.5m);
+        var refused = Assert.IsType<TransitionOutcome.Refused>(AwardRound.Rank(collected, BonusPolicies.NeedBased, -1));
+        Assert.Contains("negative", refused.Reason);
+    }
+
+    // ---------- REPEATED OPERATION ----------
+    [Fact]
+    public void RepeatedOperation_RankTwiceIsRefused_FinalizeTwiceReturnsSameState()
+    {
+        var store = new RoundStore(AwardRound.Open(SampleApplications(), 2.5m));
+        store.Apply(s => AwardRound.Rank(s, BonusPolicies.NeedBased, 3));
+        var ranked = store.Current;
+
+        Assert.IsType<TransitionOutcome.Refused>(store.Apply(s => AwardRound.Rank(s, BonusPolicies.MeritBased, 3)));
+        Assert.Same(ranked, store.Current);                      // second Rank did not replace the ranking
+
+        store.Apply(AwardRound.Finalize);
+        var finalized = store.Current;
+        var again = Assert.IsType<TransitionOutcome.Accepted>(store.Apply(AwardRound.Finalize));
+
+        Assert.Same(finalized, again.Next);                      // documented safe rule: same outcome
+        Assert.Same(finalized, store.Current);
+        Assert.IsType<TransitionOutcome.Refused>(store.Apply(s => AwardRound.Rank(s, BonusPolicies.NeedBased, 3)));
+    }
+
+    // ---------- BOUNDARY VALUE (exact limits of factory and transition) ----------
+    [Fact]
+    public void Boundary_Factory_GpaAtMinimumAndAtMaximumAccepted_JustBelowRejected()
+    {
+        Assert.IsType<EligibilityOutcome.Eligible>(EligibleApplication.Create(App("a", gpa: 2.5m), 2.5m));
+        Assert.IsType<EligibilityOutcome.Eligible>(EligibleApplication.Create(App("b", gpa: 4.0m), 2.5m));
+        Assert.IsType<EligibilityOutcome.Ineligible>(EligibleApplication.Create(App("c", gpa: 2.49m), 2.5m));
+        Assert.IsType<EligibilityOutcome.Eligible>(EligibleApplication.Create(App("d", hours: 0, income: 0m), 2.5m));
+    }
+
+    [Fact]
+    public void Boundary_Transition_ZeroAwardSlotsIsAccepted_AndAwardsNobody()
+    {
+        var ranked = Assert.IsType<RoundState.Ranked>(
+            Accepted(AwardRound.Rank(AwardRound.Open(SampleApplications(), 2.5m), BonusPolicies.NeedBased, 0)));
+        Assert.Equal(0, ranked.Result.AwardedCount);
+        Assert.Equal(5, ranked.Result.Ranking.Length);
+    }
+
+    // ---------- STATE PRESERVATION ----------
+    [Fact]
+    public void StatePreservation_FailedTransitionsLeaveStateAndStoreUnchanged()
+    {
+        var collected = Assert.IsType<RoundState.Collected>(AwardRound.Open(SampleApplications(), 2.5m));
+        var eligibleBefore = collected.Eligible.Select(e => e.Id).ToArray();
+        var store = new RoundStore(collected);
+
+        store.Apply(AwardRound.Finalize);                                              // refused: not ranked
+        store.Apply(s => AwardRound.Rank(s, BonusPolicies.NeedBased, -5));             // refused: bad slots
+        Assert.Throws<InvalidOperationException>(() =>
+            store.Apply(s => AwardRound.Rank(s, _ => throw new InvalidOperationException("policy failed"), 3)));
+
+        Assert.Same(collected, store.Current);                                         // store not changed
+        Assert.Equal(eligibleBefore, collected.Eligible.Select(e => e.Id).ToArray());  // state content not changed
+        Assert.Equal(2, collected.Rejected.Length);
+    }
+
+    [Fact]
+    public void StatePreservation_FailedConstruction_DoesNotChangeInputList()
+    {
+        var list = new List<ScholarshipApplication> { App("ok"), App("bad", gpa: 1.0m) };
+        var snapshot = list.ToArray();
+
+        var screening = Stages.Screen(list, 2.5m);
+
+        Assert.Equal(new[] { "ok" }, screening.Eligible.Select(e => e.Id).ToArray());
+        Assert.Equal("bad", Assert.Single(screening.Rejected).Id);
+        Assert.True(snapshot.SequenceEqual(list));
+    }
+
+    private static RoundState Accepted(TransitionOutcome outcome) =>
+        outcome switch
+        {
+            TransitionOutcome.Accepted a => a.Next,
+            _ => throw new InvalidOperationException("test helper: transition should be accepted")
+        };
 }

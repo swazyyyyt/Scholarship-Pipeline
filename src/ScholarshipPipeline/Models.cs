@@ -2,7 +2,7 @@ using System.Collections.Immutable;
 
 namespace ScholarshipPipeline;
 
-/// <summary>A validated scholarship application (domain data, never raw text).</summary>
+/// <summary>A parsed scholarship application (typed data, NOT yet checked against the eligibility rules: use EligibleApplication.Create).</summary>
 public sealed record ScholarshipApplication(
     string Id,
     string Name,
@@ -12,7 +12,7 @@ public sealed record ScholarshipApplication(
     bool HasDisciplinaryRecord);
 
 /// <summary>Output of stage 2: an application together with its computed score.</summary>
-public sealed record ScoredApplication(ScholarshipApplication Application, int Score);
+public sealed record ScoredApplication(EligibleApplication Candidate, int Score);
 
 /// <summary>One row of the final ranking.</summary>
 public sealed record Recommendation(int Rank, string Id, string Name, int Score, bool Awarded);
