@@ -1,5 +1,222 @@
 # Scholarship Application Scoring Pipeline
 
+Assignment 7 - Exception Handling in FP (Introduction to Functional Programming, 2026-2027).
+This is the **same runnable project** as Assignments 5 and 6 (pipeline stages, validated factory, explicit states, safe transitions), extended with an explicit `Result`/`Option` model, `Map`/`Bind` composition and boundary exception handling. Assignment 5 and 6 documentation is kept below ("Background") and is still valid.
+
+## Team
+
+| Name | Group | Implemented logic | Tests | Documentation |
+|------|-------|-------------------|-------|---------------|
+| Yerkinbek Alikhan | IT-2505 | `Result`, `Option`, `AppError`, `RoundOperations`, `ScholarshipService` chains, `ApplicationLoader`/`ApplicationStore`, `Program` integration | `ErrorHandlingTests.cs` (35 cases) | this README (individual project) |
+
+## Prerequisites, working directory, commands
+
+- **.NET SDK 8.0** (`dotnet --version` -> 8.0.x; the projects use `RollForward=Major`, so a newer SDK also works). Internet is needed on the first build to restore the xUnit packages from NuGet.
+- **Working directory:** the folder that contains `ScholarshipPipeline.sln` and `data/` (the commands below use relative `data/...` paths).
+
+```
+dotnet build
+dotnet test
+dotnet run --project src/ScholarshipPipeline -- data/applications.csv both            # normal run (A5/A6 output, now through the Result chain)
+dotnet run --project src/ScholarshipPipeline -- data/applications.csv a7              # ALL Assignment 7 demonstrations
+dotnet run --project src/ScholarshipPipeline -- data/applications.csv explain S003    # one applicant: success
+dotnet run --project src/ScholarshipPipeline -- data/applications.csv explain S005    # domain failure (not eligible)
+dotnet run --project src/ScholarshipPipeline -- data/applications.csv explain S999    # missing lookup
+dotnet run --project src/ScholarshipPipeline -- data/nope.csv both                    # file failure: missing file
+dotnet run --project src/ScholarshipPipeline -- data/invalid.csv both                 # file failure: malformed content
+dotnet run --project src/ScholarshipPipeline -- data/applications.csv demo            # A6 safe-transition demo (unchanged)
+```
+
+Optional policy for `explain`: `... explain S002 merit`. Exit codes: **0** success, **1** expected domain failure, **2** operational problem (file) or wrong usage. No demonstrated case ends in an unhandled exception.
+
+## Workflow, input, rules, output (short)
+
+A scholarship committee loads applications from CSV (`id,name,gpa,monthlyIncome,volunteerHours,hasDisciplinaryRecord`), screens them through the validated factory, scores/ranks them with a bonus policy (need-based or merit-based) and finalizes the top 3 awards (rules and dataset: see Background A5/A6). Output: ineligible applications with reasons, the ranking table and summary per policy, or a clear error. New in A7: every step that can fail *in an expected way* returns a `Result`, and the file layer reports problems as values.
+
+## Task 1 - Explicit domain outcomes (`Result.cs`, `AppError.cs`)
+
+`Result<T,E>` is a closed hierarchy with a **private constructor** and exactly two sealed cases: `Success(Value)` and `Failure(Error)`. `null` payloads are rejected at construction, and the payload can only be read after the case is known (`Match` / pattern matching), so "success without payload" and "failure that has a value" cannot exist. `AppError(Kind, Code, Message)` is the structured error: `Kind` is `Domain` (expected business failure) or `Operational` (environment); the message always names the rule / applicant / file.
+
+| # | Case | Input | Expected result | Error code and message content |
+|---|------|-------|-----------------|--------------------------------|
+| 0 | **Success** | whole round, need-based, 3 slots | `Finalized` state; awards S001, S007, S003; average 85.60 | - |
+| 0 | **Success** | `explain S003` (need-based) | `S003 Dana: rank 3, score 89, AWARDED` | - |
+| 1 | Invalid input (like an invalid quantity) | `AwardSlots = -1` | Failure, state unchanged | `INVALID_AWARD_SLOTS` - "Award slots must not be negative (got -1)." |
+| 1b | Invalid input | `MinGpa = 4.5` | Failure (no exception) | `INVALID_SETTINGS` - "Minimum GPA 4.5 must be between 0 and 4." |
+| 2 | Missing required item | `explain S999` | Failure, later steps skipped | `APPLICANT_NOT_FOUND` - "Applicant 'S999' does not exist in the loaded applications." |
+| 3 | Validation rejects the item | `explain S005` / `explain S006` | Failure | `NOT_ELIGIBLE` - names the applicant and **every** violated rule ("gpa 2.4 is below the minimum 2.5" / "has a disciplinary record") |
+| 4 | State does not permit the operation | `Finalize` before `Rank` | Failure, state unchanged | `ROUND_NOT_RANKED` - "The round must be ranked before it can be finalized." |
+| 5 | State does not permit the operation | `Rank` on an already ranked round | Failure, ranking not replaced | `ALREADY_RANKED` - "The round is already ranked; finalize it." (`ROUND_FINALIZED` after finalize) |
+
+No business failure uses an exception. `ArgumentNullException` / `ArgumentOutOfRangeException` remain only for programmer errors (a null argument), as in A6.
+
+**Validation failure vs workflow state (what each type represents).** `NOT_ELIGIBLE` is a *validation* failure: the **data** of the applicant breaks a rule (produced by the A6 factory `EligibleApplication.Create`, which returns the `EligibilityOutcome` cases `Eligible` / `Ineligible`). `ROUND_NOT_RANKED` / `ALREADY_RANKED` / `ROUND_FINALIZED` are *workflow-state* failures: the data is fine but the **current state** of the round (`RoundState.Collected` / `Ranked` / `Finalized`) does not permit the operation. `TransitionOutcome.Refused` now carries a stable `Code`, and `RoundOperations.ToResult` turns `Accepted` -> `Success` and `Refused` -> `Failure(Domain error)`, so the A6 safe transitions are the single source of those rules and stay active.
+
+## Task 2 - Missing values (`Option.cs`, `Applicants.cs`)
+
+`Option<T>` = `Some(value)` / `None` (private constructor, closed, no `null`/`default(T)` as absence, no `!` operator).
+
+| Lookup | Returns | Present | Absent | Meaning |
+|--------|---------|---------|--------|---------|
+| `ApplicantLookup.Find(apps, id)` | `Option<ScholarshipApplication>` | `Some(app)` | `None` -> `ToResult` -> `APPLICANT_NOT_FOUND` | **required** by `ExplainApplicant`, so absence becomes a Result failure |
+| `ApplicantLookup.FindRecommendation(result, id)` | `Option<Recommendation>` | `Some(rec)` | `None` (screened out / not ranked) -> `ToResult` failure | required by the final step of `ExplainApplicant` |
+| `ApplicantLookup.VolunteerHours(apps, id)` | `Option<int>` | `Some(0)` for S004 (**0 hours is legitimate data**), `Some(120)` for S001 | `None` for unknown id | primitive value: zero is **not** absence |
+
+No lookup in this workflow is optional, so there is no "apply default" behaviour; no fabricated record is ever returned. (Ids are compared ordinally: `s003` is absent.)
+
+## Task 3 - `Map` and `Bind` (`Result.cs`, `Applicants.cs`)
+
+- `Map : Result<T,E> + Func<T,U> -> Result<U,E>` - the function is **pure** and returns a plain value; `Map` wraps it in `Success`.
+- `Bind : Result<T,E> + Func<T,Result<U,E>> -> Result<U,E>` - the function may itself fail and already returns a `Result`; `Bind` returns it **as is** (`Same` instance), otherwise we would get `Result<Result<U,E>,E>`. That is why the return types of the supplied functions differ.
+- On `Failure` both return the same error and **never call the function**. The payload is only read inside the `Success` branch.
+
+Real chain 1 - the whole round (`ScholarshipService.RunRound` / `BuildReport`):
+
+```
+ValidateSettings(settings)                       Result<PipelineSettings>
+ .Map  (valid => AwardRound.Open(apps, MinGpa))  pure: screening through the A6 factory -> Collected
+ .Bind (state => RoundOperations.Rank(...))      may refuse: INVALID_AWARD_SLOTS / ALREADY_RANKED
+ .Bind (RoundOperations.Finalize)                may refuse: ROUND_NOT_RANKED
+ .Bind (RoundOperations.ResultOf)                extract the ranking (Result)
+ .Map  (result => ResultFormatter.Format(...))   pure display text
+```
+
+Real chain 2 - one applicant (`ScholarshipService.ExplainApplicant`, the "quote-style" chain):
+
+```
+ApplicantLookup.Find(id).ToResult(...)           Option -> Result: missing applicant -> APPLICANT_NOT_FOUND
+ .Bind RequireEligible                           A6 factory: NOT_ELIGIBLE with all reasons
+ .Bind RunRound(...) .Bind ResultOf              the full round above (may fail)
+ .Bind FindRecommendation(...).ToResult(...)     lookup in the ranking (Option -> Result)
+ .Map  ToView                                    pure display model
+```
+
+A missing applicant stops the chain before the round runs (proved by a counting policy in `FailurePropagation_MissingOrIneligibleApplicant_SkipsTheWholeRound`). The **final outcome is handled once** in `Program.Report` via `Result.Match`.
+
+## Task 4 - Boundary exception handling (`ApplicationLoader.cs`)
+
+File access exists **only** in `ApplicationLoader.Load` (domain functions, stages and `ScholarshipService` never touch files). Exceptions are caught narrowly and converted into `Failure` with kind `Operational` and the file path in the message.
+
+| Problem | Caught | Outcome |
+|---------|--------|---------|
+| File or directory missing; blank path | `FileNotFoundException`, `DirectoryNotFoundException` / explicit check | `FILE_NOT_FOUND` + path |
+| Cannot read (path is a directory, permissions, I/O) | `UnauthorizedAccessException`, `IOException` | `FILE_UNREADABLE` + path + system message |
+| Empty file, wrong header, bad number / flag, missing field, wrong field count, duplicate id, out-of-range value | `ApplicationCsvParser` row/format checks (no exception) | `MALFORMED_CONTENT` + path + **every** problem with its line number |
+
+There is no empty `catch`, no catch-all and no fallback. **Behaviour change vs A5:** a file with any invalid row is now rejected **as a whole** (A5 kept the valid rows and reported the bad ones); this guarantees no partial data. `ApplicationCsvParser.Parse` itself is unchanged, so the A5 parser tests still hold. A header-only file is a valid empty dataset, not an error.
+
+**State preservation.** `ApplicationStore.Reload(path)` replaces `Current` (an immutable array) **only** when loading fully succeeded; on any failure `Current` is not touched (demos 7 and 8 print "unchanged: True"). The A6 `RoundStore` keeps the same rule for round states.
+
+## Task 5 - Demonstrations (`dotnet run --project src/ScholarshipPipeline -- data/applications.csv a7`)
+
+Covers: normal path (round and applicant), three kinds of domain failure (invalid input, state, validation), present and missing lookups (incl. the legitimate zero), the two file failures with preserved data, and the A6 pipeline / safe transitions still working afterwards. Actual output:
+
+```
+
+=== 1. Normal path: whole round (validate -> Map open -> Bind rank -> Bind finalize -> Map format) ===
+=== Policy: need-based ===
+Eligible: 5 | Awarded: 3 | Average score: 85.60
+Rank  Id    Name        Score  Awarded
+1     S001  Aigerim     108    yes
+2     S007  Hanna       96     yes
+3     S003  Dana        89     yes
+4     S002  Bekzat      75     no
+5     S004  Erlan       60     no
+
+=== 2. Normal path: applicant S003 (Find -> Bind eligible -> Bind round -> Bind lookup -> Map view) ===
+S003 Dana: rank 3, score 89, AWARDED
+
+=== 3. Domain failure: invalid input (negative award slots) ===
+REJECTED [Domain/INVALID_AWARD_SLOTS] Award slots must not be negative (got -1).
+
+=== 4. Domain failure: state does not permit (Finalize before Rank, then Rank twice) ===
+REJECTED [Domain/ROUND_NOT_RANKED] The round must be ranked before it can be finalized.
+Rank accepted -> Ranked
+REJECTED [Domain/ALREADY_RANKED] The round is already ranked; finalize it.
+
+=== 5. Domain failure: validation (applicants S005 gpa too low, S006 disciplinary record) ===
+REJECTED [Domain/NOT_ELIGIBLE] Applicant 'S005' is not eligible: gpa 2.4 is below the minimum 2.5.
+REJECTED [Domain/NOT_ELIGIBLE] Applicant 'S006' is not eligible: has a disciplinary record.
+
+=== 6. Lookup: present and missing (and a legitimate zero) ===
+Hours of S001 : Some(120)
+Hours of S004 : Some(0)   (0 hours is real data, not absence)
+Hours of S999 : None
+REJECTED [Domain/APPLICANT_NOT_FOUND] Applicant 'S999' does not exist in the loaded applications.
+
+=== 7. File failure: missing file (stored data preserved) ===
+FAILED [Operational/FILE_NOT_FOUND] Data file 'data/does-not-exist.csv' was not found.
+Applications before: 7, after: 7 (unchanged: True)
+
+=== 8. File failure: malformed content (stored data preserved) ===
+FAILED [Operational/MALFORMED_CONTENT] Data file 'data/invalid.csv' is malformed (7 problem(s)): Line 3: gpa 'abc' is not a number. | Line 4: gpa 4.5 must be between 0.0 and 4.0. | Line 5: monthlyIncome -5 must not be negative. | Line 6: volunteerHours is missing. | Line 7: hasDisciplinaryRecord 'maybe' is not 'true' or 'false'. | Line 8: expected 6 fields but found 4. | Line 9: duplicate id 'S101'.
+Applications before: 7, after: 7 (unchanged: True)
+
+=== 9. Pipeline and safe transitions still work after the failures ===
+S001 Aigerim: rank 1, score 108, AWARDED
+--- Sequence demo (need-based) ---
+1. Finalize before Rank   : REFUSED: The round must be ranked before it can be finalized.
+2. Rank with -1 slots     : REFUSED: Award slots must not be negative (got -1).
+   state still unchanged  : True
+3. Rank (valid)           : ACCEPTED -> Ranked
+4. Rank again             : REFUSED: The round is already ranked; finalize it.
+5. Finalize               : ACCEPTED -> Finalized
+6. Finalize again         : ACCEPTED -> Finalized (same state: True)
+```
+
+Malformed file from the command line (`data/invalid.csv both`, exit code 2):
+
+```
+FAILED to load data: [Operational/MALFORMED_CONTENT] Data file 'data/invalid.csv' is malformed (7 problem(s)): Line 3: gpa 'abc' is not a number. | Line 4: gpa 4.5 must be between 0.0 and 4.0. | Line 5: monthlyIncome -5 must not be negative. | Line 6: volunteerHours is missing. | Line 7: hasDisciplinaryRecord 'maybe' is not 'true' or 'false'. | Line 8: expected 6 fields but found 4. | Line 9: duplicate id 'S101'.
+```
+
+## Requirement map
+
+| Requirement | Files / methods |
+|-------------|-----------------|
+| Result with two protected cases, structured error | `Result.cs`, `AppError.cs` |
+| >= 3 domain failures | `RoundOperations.ValidateSettings`/`Rank`/`Finalize`, `ScholarshipService.RequireEligible`, `ExplainApplicant` |
+| Option, real lookups, zero is not absence | `Option.cs`, `ApplicantLookup.Find` / `FindRecommendation` / `VolunteerHours` |
+| `Map`, `Bind`, failure propagation | `Result<T,E>.Map`, `.Bind`; chains in `ScholarshipService.RunRound`, `BuildReport`, `ExplainApplicant` |
+| Final outcome handled once | `Program.Report` (`Match`) |
+| Boundary exceptions, no partial update | `ApplicationLoader.Load`, `ApplicationStore.Reload` |
+| A6 safe transitions kept | `AwardRound`, `RoundStore`, `RoundOperations.ToResult`; `demo` mode |
+| Tests | `tests/ScholarshipPipeline.Tests/ErrorHandlingTests.cs` (+ A5/A6 `WorkflowTests.cs`) |
+
+## Tests (xUnit, `dotnet test`)
+
+New A7 file `ErrorHandlingTests.cs` - 35 test cases (with theory rows); A5/A6 `WorkflowTests.cs` - 55 cases that still pass. File tests use a unique temp directory per test and delete it in `Dispose`; sample files are copied from `data/` into the test output.
+
+| Required case | Tests |
+|---------------|-------|
+| Complete success | `CompleteSuccess_RunRound_...`, `CompleteSuccess_BuildReport_...`, `CompleteSuccess_ExplainApplicant_...` (3 rows), `Integration_FileToReport_...` |
+| Domain failures + useful error | `DomainFailure_InvalidAwardSlots_...`, `..._InvalidMinGpa_...`, `..._StateDoesNotPermit_FinalizeBeforeRank`, `..._RankTwice_...`, `..._NotEligible_...` (2 rows), `..._RequiredApplicantMissing_...` |
+| Lookup present and absent | `LookupPresentAndAbsent_...`, `LookupLegitimateZero_...`, `Option_ZeroFalseAndEmptyString_...`, `Option_ToResult_...` |
+| Map success | `MapSuccess_TransformationReceivesValueAndReturnsNewValue` |
+| Bind success | `BindSuccess_NextOperationReceivesValue_AndItsResultIsPreserved` (`Same`), `BindSuccess_FailureReturnedByNextOperationIsPreserved` |
+| Failure propagation (non-execution) | `FailurePropagation_MapAndBind_...` (counters), `FailurePropagation_MissingOrIneligibleApplicant_...` (policy double, 0 calls), `FailurePropagation_InvalidSettings_StopsBeforeOpenRankAndFinalize` (3 counters) |
+| Missing file | `Boundary_MissingFile_ReportsFileAndKeepsPreviousData`, `Boundary_MissingDirectoryAndBlankPath_...`, `Boundary_PathIsADirectory_...` |
+| Malformed file | `Boundary_MalformedFile_BecomesClearFailure_WithoutPartialUpdate`, `Boundary_SampleInvalidFile_...`, `Boundary_EmptyFileOrWrongHeader_...` (2 rows), `Boundary_HeaderOnlyFile_...`, `Boundary_SuccessfulReload_...` |
+| Result invariants, A6 transitions still safe | `ResultAndOption_CannotRepresentContradictoryStates`, `SafeTransitions_StayActive_...` |
+
+**Latest test outcome:** all 90 test cases (35 new A7 + 55 from A5/A6) passed, 0 failed. Note: this was checked in an offline environment with a small assertion runner (the same test source files, `Fact`/`Theory`/`Assert` re-implemented) because NuGet was unreachable. The suite was also run with a comma as the decimal separator (error messages use `InvariantCulture`, so they do not depend on the Windows regional settings). A deliberate break of the loader made 4 of the new tests fail, so the assertions are effective. **Please run `dotnet test` once on your machine and replace this line with the real xUnit numbers.**
+
+## Defense notes
+
+- *Why different return types:* `Map` wraps a plain value, `Bind` returns the function's own `Result` (see `BindSuccess_...` `Assert.Same`).
+- *Proof that a dependent function is skipped:* `FailurePropagation_*` tests (counters stay 0).
+- *Zero vs absence:* `VolunteerHours("S004")` is `Some(0)`, `VolunteerHours("S999")` is `None`.
+- *Exception boundary:* `ApplicationLoader.Load` only; state preserved by `ApplicationStore.Reload` (assign only on success).
+- *Live modification ideas:* add a new rule (e.g. maximum 2 awards per income band) as a new error code in `ErrorCodes` + one `Bind` step + one test; or a new file problem in `ApplicationLoader`.
+
+## Contributions
+
+- Yerkinbek Alikhan, IT-2505 - individual project: Result/Option, chains, boundary, integration, tests, documentation.
+
+---
+
+# Background: Assignment 6 documentation (still valid)
+
 Assignment 6 - Handling Temporal Coupling (Introduction to Functional Programming, 2026-2027).
 The project is the same runnable project as Assignment 5, extended with a validated factory, explicit states and safe transitions.
 
@@ -251,7 +468,7 @@ Rank  Id    Name        Score  Awarded
 5     S004  Erlan       50     no
 ```
 
-Failure demo (`data/invalid.csv`): 7 lines starting with `REJECTED:` (lines 3-9), 1 valid application parsed, exit code 1.
+Failure demo (`data/invalid.csv`): 7 lines starting with `REJECTED:` (lines 3-9), 1 valid application parsed, exit code 1. **Superseded in Assignment 7:** the file is now rejected as a whole with `MALFORMED_CONTENT` (exit code 2); see Task 4 of A7. The parser itself and its A5 tests are unchanged.
 Empty demo (`data/empty.csv`): `Parsed 0 valid application(s).`, then `(no eligible applications)` for each policy.
 
 ### A5 tests (xUnit, `dotnet test`)

@@ -26,7 +26,8 @@ public abstract record TransitionOutcome
 
     public sealed record Accepted(RoundState Next) : TransitionOutcome;
 
-    public sealed record Refused(string Reason) : TransitionOutcome;
+    /// <summary>Refusal with a readable reason and a stable code (the code lets the Result layer build a structured error).</summary>
+    public sealed record Refused(string Reason, string Code = ErrorCodes.UnknownState) : TransitionOutcome;
 }
 
 /// <summary>
@@ -52,7 +53,7 @@ public static class AwardRound
         ArgumentNullException.ThrowIfNull(bonusPolicy);
 
         if (awardSlots < 0)
-            return new TransitionOutcome.Refused($"Award slots must not be negative (got {awardSlots}).");
+            return new TransitionOutcome.Refused($"Award slots must not be negative (got {awardSlots}).", ErrorCodes.InvalidAwardSlots);
 
         return state switch
         {
@@ -60,8 +61,8 @@ public static class AwardRound
                 new RoundState.Ranked(
                     Stages.BuildResult(Stages.ScoreApplications(c.Eligible, bonusPolicy), awardSlots),
                     c.Rejected)),
-            RoundState.Ranked => new TransitionOutcome.Refused("The round is already ranked; finalize it."),
-            RoundState.Finalized => new TransitionOutcome.Refused("The round is already finalized; ranking is closed."),
+            RoundState.Ranked => new TransitionOutcome.Refused("The round is already ranked; finalize it.", ErrorCodes.AlreadyRanked),
+            RoundState.Finalized => new TransitionOutcome.Refused("The round is already finalized; ranking is closed.", ErrorCodes.RoundFinalized),
             _ => new TransitionOutcome.Refused("Unknown round state.")
         };
     }
@@ -72,7 +73,7 @@ public static class AwardRound
 
         return state switch
         {
-            RoundState.Collected => new TransitionOutcome.Refused("The round must be ranked before it can be finalized."),
+            RoundState.Collected => new TransitionOutcome.Refused("The round must be ranked before it can be finalized.", ErrorCodes.RoundNotRanked),
             RoundState.Ranked r => new TransitionOutcome.Accepted(new RoundState.Finalized(r.Result, r.Rejected)),
             RoundState.Finalized f => new TransitionOutcome.Accepted(f),   // repeated call: same outcome, no change
             _ => new TransitionOutcome.Refused("Unknown round state.")
