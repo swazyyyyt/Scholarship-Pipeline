@@ -48,6 +48,19 @@ public static class Stages
     }
 
     /// <summary>
+    /// A8 overload: the whole score is ONE configured function (see Scoring.CreateScore), calculated once per application.
+    /// The A5 overload above is the same stage with the base + volunteer + bonus composition fixed.
+    /// </summary>
+    public static ImmutableArray<ScoredApplication> ScoreApplicationsWith(
+        IReadOnlyList<EligibleApplication> eligible,
+        Func<ScholarshipApplication, int> score)
+    {
+        ArgumentNullException.ThrowIfNull(eligible);
+        ArgumentNullException.ThrowIfNull(score);
+        return eligible.Select(a => new ScoredApplication(a, score(a.Application))).ToImmutableArray();
+    }
+
+    /// <summary>
     /// Stage 3: IReadOnlyList&lt;ScoredApplication&gt; + slots -> ScholarshipResult.
     /// Ranks by score (desc), then GPA (desc), then Id (ordinal); the first awardSlots are awarded.
     /// </summary>
@@ -57,9 +70,7 @@ public static class Stages
         ArgumentOutOfRangeException.ThrowIfNegative(awardSlots);
 
         var ranking = scored
-            .OrderByDescending(s => s.Score)
-            .ThenByDescending(s => s.Candidate.Gpa)
-            .ThenBy(s => s.Candidate.Id, StringComparer.Ordinal)
+            .OrderForRanking()   // A8 extension: the single ranking rule (score desc, GPA desc, Id asc)
             .Select((s, index) => new Recommendation(
                 index + 1, s.Candidate.Id, s.Candidate.Name, s.Score, index < awardSlots))
             .ToImmutableArray();

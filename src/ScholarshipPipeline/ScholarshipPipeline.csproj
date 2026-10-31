@@ -8,4 +8,17 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="ScholarshipPipeline.Tests" />
+  </ItemGroup>
+
+  <!-- Native library (built from ../../native/scholarship_native.c, see README). The binary for the current OS/architecture
+       is copied next to the application, where the runtime resolves DllImport("scholarship_native"). -->
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Linux')) And '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'X64'">
+    <Content Include="..\..\native\lib\linux-x64\libscholarship_native.so" Link="libscholarship_native.so" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows')) And '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'X64'">
+    <Content Include="..\..\native\lib\win-x64\scholarship_native.dll" Link="scholarship_native.dll" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
 </Project>

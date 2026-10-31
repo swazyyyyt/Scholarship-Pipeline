@@ -1,5 +1,187 @@
 # Scholarship Application Scoring Pipeline
 
+**Assignment 8 - Extension Methods and LINQ** (Introduction to Functional Programming, 2026-2027).
+This is the **same runnable project** as Assignments 5, 6 and 7 (pipeline stages, validated factory, safe transitions, `Result`/`Option`, `Map`/`Bind`, boundary errors). Assignment 8 adds reusable queries, a curried scoring function, lazy processing with safe resource ownership, a small native C library called through P/Invoke, and an integrated workflow that runs two reports and exports a file. The earlier documentation is kept below ("Background") and is still valid.
+
+## Team
+
+| Name | Group | Implemented logic | Tests | Documentation |
+|------|-------|-------------------|-------|---------------|
+| Yerkinbek Alikhan | IT-2505 | `Extensions.cs`, `Reports.cs`, `Scoring.cs`, `Streaming.cs`, `NativeStipend.cs`, `ReportExporter.cs`, `PayoutWorkflow.cs`, `native/*.c`, `Program.cs` (`a8` mode) | `Assignment8Tests.cs` (36 test methods) + earlier tests | this README (individual project) |
+
+## Prerequisites, working directory, commands
+
+- **.NET SDK 8.0** (`dotnet --version` -> 8.0.x; `RollForward=Major`, so a newer SDK works too). Internet is needed on the first build to restore the xUnit packages from NuGet.
+- **Native library:** a prebuilt binary for **linux-x64** and **win-x64** is included in `native/lib/`. A C compiler is only needed to rebuild it (see "Native build").
+- **Working directory:** the folder that contains `ScholarshipPipeline.sln`, `data/` and `native/`.
+
+```
+dotnet build
+dotnet test
+dotnet run --project src/ScholarshipPipeline -- data/applications.csv a8 academic   # ALL Assignment 8 demonstrations, academic scoring
+dotnet run --project src/ScholarshipPipeline -- data/applications.csv a8 service    # same, other configured scoring function
+dotnet run --project src/ScholarshipPipeline -- data/nope.csv a8                    # file failure: missing file (exit code 2)
+dotnet run --project src/ScholarshipPipeline -- data/invalid.csv a8                 # file failure: malformed content (exit code 2)
+dotnet run --project src/ScholarshipPipeline -- data/applications.csv a7            # earlier demonstrations still work
+```
+
+The `a8` run writes `output/payouts-<configuration>.csv` (the `output/` folder is created at run time and ignored by git). Exit codes as before: **0** success, **1** domain failure, **2** operational problem or wrong usage.
+
+## Workflow, input, rules, expected results
+
+Input: CSV `id,name,gpa,monthlyIncome,volunteerHours,hasDisciplinaryRecord` (`data/applications.csv`, 7 applicants; S005 and S006 are screened out by the validated factory, 5 are eligible). Domain rules are unchanged (eligible = GPA >= 2.5 and no disciplinary record; first 3 by rank are awarded).
+
+A8 workflow: `Load (A7)` -> `Ensure` not empty -> **pure** `BuildReports` (deferred scoring, one materialised snapshot, two LINQ reports) -> **native boundary** `AddStipends` (C function per awarded applicant) -> **file boundary** `ExportPayouts`. The first failure skips the remaining steps, so nothing is exported after a failure.
+
+Expected results on `data/applications.csv` (hand calculated, checked by tests):
+
+| Id | academic score | service score | income band |
+|----|---------------:|--------------:|-------------|
+| S001 | 123 | 99 | low |
+| S002 | 101 | 60 | high |
+| S003 | 82 | 78 | low |
+| S004 | 63 | 48 | middle |
+| S007 | 120 | 87 | middle |
+
+Academic scoring awards **S001, S007, S002** (stipends 15375, 13200, 10100; total 38675). Service scoring awards **S001, S007, S003** (stipends 12375, 9570, 9750; total 31695). The different result on the same input (S002 vs S003) is the documented difference of the two configured functions.
+
+## Requirement map
+
+| Requirement | Files and methods |
+|-------------|-------------------|
+| Task 1 extension methods (used) | `Extensions.cs`: `OrderForRanking` (used in `Stages.BuildResult` and `Reports.Shortlist`), `Ensure` (used in `PayoutWorkflow.Run`), `Traverse` (used in `PayoutWorkflow.AddStipends`) |
+| Task 2 two LINQ reports | `Reports.cs`: `Shortlist`, `IncomeBands`; text in `ReportFormatter`; data loaded from CSV by `ApplicationLoader` |
+| Task 3 currying / partial application | `Scoring.cs`: `CreateScore`, `AcademicFocus`, `ServiceFocus`, used by `PayoutWorkflow.BuildReports` |
+| Task 4 deferred execution | `Streaming.cs`: `LazyScoring.ScoreEligible` (`yield return`), materialisation in `PayoutWorkflow.BuildReports` |
+| Task 5 disposal | `Streaming.cs`: `LineSource` (used by `ApplicationLoader.Load`), `ReportExporter.WriteTo` / `ExportPayouts` |
+| Task 6 resource note | section "Resource note" below |
+| Tasks 7-9 native C library | `native/scholarship_native.c/.h`, `native/build.sh`, `native/build.cmd`, `NativeStipend.cs` (`NativeMethods`, `NativeStipendCalculator`), csproj `Content` items |
+| Integration | `PayoutWorkflow.Run`, `Program.cs` `RunA8Demo` |
+| Failures as `Result` | new codes in `AppError.cs`: `NO_APPLICATIONS`, `INVALID_STIPEND_INPUT`, `NATIVE_LOAD_FAILED`, `NATIVE_BINDING_FAILED`, `NATIVE_REJECTED_INPUT`, `EXPORT_FAILED` (plus all A7 codes) |
+
+## Task 1 - Extension methods (`Extensions.cs`)
+
+| Method | Receiver -> return | Behaviour | Why it belongs on the receiver |
+|--------|--------------------|-----------|--------------------------------|
+| `OrderForRanking` | `IEnumerable<ScoredApplication>` -> `IOrderedEnumerable<ScoredApplication>` | Score desc, then GPA desc, then Id (ordinal). Lazy, does not change the input. | It is a query step on a sequence of scored applications and is chained like `Where`/`Select`. It is the ONE ranking rule: the A5 ranking stage and the shortlist report both call it, so they cannot drift apart. |
+| `Ensure` | `Result<T,E>` -> `Result<T,E>` | Keeps a success only if a predicate holds, otherwise returns a failure built from the value. A failure passes through and the predicate is not called. | It is a chain step like `Map`/`Bind`; the call reads `Load(..).Ensure(notEmpty, ..).Bind(..)`. Used to turn "valid file with zero applications" into a clear `NO_APPLICATIONS` failure. |
+| `Traverse` | `IEnumerable<T>` -> `Result<ImmutableArray<U>,E>` | Applies a Result-returning function to every item; the **first failure stops** the loop. Empty input is a success with an empty array. | It turns "a sequence of steps that can fail" into one Result. Used for the native stipend calls so a failing library is called once, not once per applicant. |
+
+None of them mutates its receiver or any shared state.
+
+## Task 2 - LINQ reports (`Reports.cs`)
+
+| | Report 1: award shortlist | Report 2: income band summary |
+|---|---|---|
+| Intended user | scholarship committee chair | financial office (budget per social group) |
+| Input | snapshot of scored eligible applications + `ShortlistOptions(MinScore, AwardSlots)` | the same snapshot |
+| Filters | `Where Score >= MinScore` | none (all eligible applications) |
+| Stages | `Where` -> `OrderForRanking` (`OrderByDescending`/`ThenByDescending`/`ThenBy`) -> `Select` (rank, awarded flag) | `GroupBy` income band -> `Select` (`Count`, `Sum`, `Aggregate`) -> `OrderBy` band order `ThenBy` band name |
+| Output fields | Rank, Id, Name, Score, Gpa, MonthlyIncome, Awarded | Band, Applicants, TotalScore, AverageScore, TotalVolunteerHours |
+| Expected (academic, MinScore 80, 3 slots) | S001 123 yes, S007 120 yes, S002 101 yes, S003 82 no | low: 2 / 205 / 102.50 / 170 h; middle: 2 / 183 / 91.50 / 100 h; high: 1 / 101 / 101.00 / 30 h |
+
+Bands: low = income <= 500, middle <= 1000, high above. Both reports are pure (no console, no file, no native code), take a snapshot, and are deterministic: ties are broken by GPA and Id (report 1) and by band order (report 2). Empty input and "no matches" give empty output; ineligible or invalid applicants never reach the reports because `LazyScoring` screens through the validated factory and the loader rejects malformed files.
+
+## Task 3 - Currying and partial application (`Scoring.cs`)
+
+`Compute(weights, application)` is the ordinary two-argument function. `CreateScore : ScoreWeights -> (ScholarshipApplication -> int)` is its **curried** form: the first call fixes and validates the configuration, the returned function accepts the remaining input. Two **partial applications**:
+
+- `AcademicFocus = CreateScore(25 points per GPA unit, 1 point per 20 h, max 5, merit bonus)`
+- `ServiceFocus  = CreateScore(15 points per GPA unit, 1 point per 5 h, max 20, need bonus)`
+
+Example (S001, GPA 3.9, 120 h, income 400): academic `round(3.9*25)=98 + min(6,5)=5 + 20 = 123`, service `round(3.9*15)=59 + min(24,20)=20 + 20 = 99`. The chosen function is passed into the workflow as a value (`PayoutWorkflow.Run(..., score, ...)`); no global setting is switched.
+
+## Tasks 4 and 5 - Deferred execution and disposal
+
+- `LazyScoring.ScoreEligible` is an iterator (`yield return`): creating it runs nothing; each iteration step pulls one application, screens it and calls the score function once for eligible ones. Tests observe the timing with a counting source and a counting score function (no diagnostics in production code).
+- **Materialisation point:** `PayoutWorkflow.BuildReports` calls `ToImmutableArray()` once. Both reports reuse the snapshot. Enumerating the *unmaterialised* query again would re-read the source and recompute every score (demo section 2 shows 5 calls, then 5 more); the snapshot can be reused any number of times with no recalculation and no file access.
+
+| Resource | Owner | Release point | Failure / early stop |
+|----------|-------|---------------|----------------------|
+| `StreamReader` of the input file | iterator `LineSource.ReadLines` (`using var`) | end of enumeration | disposed on exception and when enumeration stops early (`First`, `Take`), because disposing the enumerator runs the iterator's `finally` |
+| `StreamWriter` of the export | `ReportExporter.WriteTo` (`using var`) | end of the method | disposed if writing throws; `ExportPayouts` writes `<file>.tmp`, moves it over the target only after the writer is closed and deletes the temp file on failure |
+| native library handle | the .NET runtime (loaded once per process, never freed by us) | process exit | no native memory is allocated by our code |
+
+`ApplicationLoader.Load` used the convenience API `File.ReadAllText` in A7 (it opens and closes the file internally, so the file is closed before it returns). It now reads through `LineSource` and materialises the lines inside the `try` block (`ToArray`), so the stream lifetime is bounded and every IO exception still becomes `FILE_NOT_FOUND` / `FILE_UNREADABLE`. Garbage collection is not relied on for the file handle; a test opens the file exclusively after reading to prove it was released.
+
+## Resource note (Task 6)
+
+- **Materialised datasets:** the loaded `ImmutableArray<ScholarshipApplication>` (once per run), the lines of the input file (a short-lived array inside `Load`), and the scored snapshot (once per `BuildReports`). Reports are small derived arrays of rows.
+- **Retention by deferred queries / closures:** the unmaterialised `LazyScoring.ScoreEligible` query holds the source collection and the score function until it is discarded. The workflow does not store it: it is consumed by `ToImmutableArray()` inside `BuildReports` and then unreachable. The configured functions `AcademicFocus`/`ServiceFocus` capture only an immutable `ScoreWeights` record, not any data.
+- **Long-lived collections, caches, event subscriptions:** none are used. `ApplicationStore.Current` holds one immutable array and is replaced, never appended to, so it cannot grow.
+- **Design decision:** reports take a snapshot instead of a lazy query. This avoids re-reading the file and recomputing scores for the second report (repeated allocation / IO) and removes any chance of consuming a disposed reader.
+- **Trade-off streaming vs snapshot:** streaming (`LineSource`) keeps only one line in memory and could handle a very large file, but the data can be consumed once and the reader must stay open during enumeration. A snapshot costs memory proportional to the data set but is stable, reusable and lets the resource be closed immediately. The project loads a bounded snapshot because the data set is small and both reports need the same data. No memory leak was fixed here, so none is claimed.
+
+## Native C library (Tasks 7-9)
+
+**Function contract** (`native/scholarship_native.h`):
+
+```c
+int32_t sp_stipend_amount(int32_t score, int32_t monthly_income);   // cdecl, exported
+```
+
+| Item | Definition |
+|------|------------|
+| Purpose | Monthly stipend of an awarded applicant, used for the payouts in the exported report |
+| Inputs | `score` 0..200, `monthly_income` 0..1 000 000 (whole currency units) |
+| Output | stipend in **whole currency units**; `base = score * 100`; supplement 25 % if income <= 500, 10 % if income <= 1000, else 0 %; `result = base + base * supplement / 100` in integer arithmetic (fraction dropped, i.e. round down) |
+| Invalid input | returns `-1` (`SP_ERROR_INVALID_INPUT`) |
+| Types | `int32_t` <-> C# `int` (fixed 32 bit on every platform); no pointers, no native allocation, nothing to free |
+| Manual example | score 123, income 400: base 12300, +25 % = 3075, result **15375** |
+
+**C# binding and adapter** (`NativeStipend.cs`): `[DllImport("scholarship_native", EntryPoint = "sp_stipend_amount", CallingConvention = Cdecl)]` in `NativeMethods`. The runtime maps the name to `libscholarship_native.so` / `scholarship_native.dll` / `libscholarship_native.dylib` in the application folder. `NativeStipendCalculator` (the only user of the binding) validates domain input before the call (`INVALID_STIPEND_INPUT`), converts `DllNotFoundException` / `BadImageFormatException` to `NATIVE_LOAD_FAILED`, `EntryPointNotFoundException` to `NATIVE_BINDING_FAILED` and the native `-1` to `NATIVE_REJECTED_INPUT`. A fractional income is truncated toward zero before the call. No project setting is needed for `DllImport` (it is used instead of `LibraryImport`, so `AllowUnsafeBlocks` is not required).
+
+**Platform, compiler, build:**
+
+| | |
+|---|---|
+| Tested platform | Linux x86-64 (Ubuntu 24.04), .NET SDK 8.0.133, **gcc 13.3.0** |
+| Linux build | `sh native/build.sh` = `gcc -std=c11 -Wall -Wextra -Werror -O2 -shared -fPIC -o native/lib/linux-x64/libscholarship_native.so native/scholarship_native.c` |
+| Windows x64 | `native\build.cmd` (MinGW-w64 gcc) or MSVC: `cl /LD /O2 native\scholarship_native.c /Fe:native\lib\win-x64\scholarship_native.dll`. The included `scholarship_native.dll` was cross-compiled on Linux with `x86_64-w64-mingw32-gcc 13-win32` (`-shared -static -static-libgcc`); it was **not executed** in this environment. |
+| macOS | not built or tested; `cc -shared -fPIC -O2 -o native/lib/osx/libscholarship_native.dylib native/scholarship_native.c` would be the command |
+| Binary location after a clean build | `ScholarshipPipeline.csproj` copies `native/lib/<rid>/<binary>` for the current OS (x64 only) to the output folder next to `ScholarshipPipeline.dll`; the test project receives it through the project reference |
+| Architecture | x86-64 only; on another architecture the binary is not copied and the adapter reports `NATIVE_LOAD_FAILED` |
+
+**Integration difficulties and resolutions:**
+1. The runtime must find the library at run time and in the test run. Solution: a conditional `Content` item in the csproj copies the binary to the output folder, which is on the native probing path.
+2. A load failure cannot be tested by deleting the file once the real library is loaded in the process. Solution: a second binding (`StipendAmountFromMissingLibrary`) points to a library that does not exist, so the test gets a genuine `DllNotFoundException` on a fresh load, plus an injectable delegate for the other failure kinds. The real native call is tested separately and is never replaced by a test double.
+3. The native library must not contain business rules that differ from validation in C#. Solution: the adapter validates the same ranges first and the C function repeats the check for safety; both are tested.
+
+## Tests (xUnit, `dotnet test`)
+
+Cumulative: **102 test methods** (`WorkflowTests` 35 from A5/A6, `ErrorHandlingTests` 31 from A7, `Assignment8Tests` 36 new). Required coverage of A8:
+
+| Area | Tests (all in `Assignment8Tests.cs`) |
+|------|--------------------------------------|
+| Reports | `Shortlist_NormalResult_...`, `Shortlist_EmptyDataset_...`, `Shortlist_NoMatchingRecords_...`, `Shortlist_TiedPrimaryValues_...`, `IncomeBands_GroupingAndTotals_...`, `IncomeBands_EmptyInput_OrderIsDeterministic_...` |
+| Extensions | `OrderForRanking_...`, `Ensure_...`, `Traverse_...` (also covered through `Workflow_*`) |
+| Configured functions | `ConfiguredFunctions_SameInput_GiveDocumentedDifferentResults`, `ConfiguredFunctions_ChangeTheAwardedSet_...`, `CreateScore_IsCurried_...`, `ScoringByName_...` |
+| Deferred execution | `LazyScoring_CreatingTheEnumerable_DoesNotProcessAnything`, `LazyScoring_Iteration_PullsAndScoresOneItemAtATime_...`, `LazyScoring_Materialisation_...`, `LazyScoring_InvalidArguments_...` |
+| Resource lifetime | `ReadLines_OpensOnlyOnEnumeration_AndDisposesAfterSuccess`, `ReadLines_DisposesOnEarlyStop`, `ReadLines_DisposesWhenReadingFails`, `ReadFileLines_ReleasesTheFileHandle_...`, `WriteTo_DisposesWriterOnSuccessAndOnFailure` |
+| Native integration | `NativeCall_RealLibrary_ReturnsManuallyCalculatedValues` (15375, 13200, 10100, edges), `NativeFunction_ItselfReturnsMinusOne_...`, `Adapter_InvalidDomainInput_...`, `Adapter_LoadAndBindingFailures_BecomeClearResultFailures` |
+| Complete workflows | normal: `Workflow_NormalPath_ReportsNativeStipendsAndExport`, `Workflow_NoMatchingApplicants_...`; failure: `Workflow_NativeFailure_ExportsNothing_...`, `Workflow_FirstNativeFailure_StopsRemainingNativeCalls`, `Workflow_EmptyDataFile_...`, `Workflow_InvalidSettings_...`, `Workflow_ExportFailure_...` |
+| File boundaries | `Workflow_MissingFile_...`, `Workflow_MalformedContent_...`, `Loader_ReadingThroughLineSource_...` (temporary directory per test, deleted afterwards) |
+
+The suite contains well over the required minimum (8 pure/validation tests, 2 workflow tests, 2 file tests).
+
+**Latest test outcome:** all **126 test cases** (102 methods, theory rows counted separately; A5 + A6 + A7 + A8) passed, 0 failed. Note: NuGet was not reachable in the environment where this was prepared, so the run used the same test source files with a small re-implementation of `Fact`/`Theory`/`Assert` instead of the real xUnit packages. The C library, the P/Invoke calls and the file operations were real (Linux x64). **Please run `dotnet test` once on your machine and replace this line with the real xUnit numbers.** If you run on Windows, the included `scholarship_native.dll` was cross-compiled and not executed here; if the native tests fail there, rebuild it with `native\build.cmd`.
+
+## Defense notes (small changes to try)
+
+- Change the shortlist threshold: `minScore` in `Program.cs` (`RunA8Demo`) or the `minScore` argument of `PayoutWorkflow.Run`; test `Shortlist_NormalResult_...`.
+- Change the tie-breaker: `ScoringQueryExtensions.OrderForRanking` (one place for both reports); test `OrderForRanking_...`.
+- New configuration: `CreateScore(new ScoreWeights(...))` in `Scoring.cs`, add it to `Scoring.ByName`.
+- New income band limit: `Reports.LowIncomeLimit` / `MiddleIncomeLimit`; test `IncomeBands_EmptyInput_..._BandEdges`.
+- Change the stipend supplement in `scholarship_native.c`, rebuild with `native/build.sh`, update the expected values in `NativeCall_RealLibrary_...`.
+
+## Contributions
+
+- Yerkinbek Alikhan, IT-2505 - individual project: all A8 logic, native library, tests and documentation listed above.
+
+---
+
+# Background: Assignment 7 documentation (still valid)
+
 Assignment 7 - Exception Handling in FP (Introduction to Functional Programming, 2026-2027).
 This is the **same runnable project** as Assignments 5 and 6 (pipeline stages, validated factory, explicit states, safe transitions), extended with an explicit `Result`/`Option` model, `Map`/`Bind` composition and boundary exception handling. Assignment 5 and 6 documentation is kept below ("Background") and is still valid.
 

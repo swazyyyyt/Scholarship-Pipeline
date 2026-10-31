@@ -18,7 +18,9 @@ public static class ApplicationLoader
         string text;
         try
         {
-            text = File.ReadAllText(path);
+            // A8: the reader is owned by LineSource.ReadLines (disposed when the enumeration ends or fails); the lines are
+            // materialised here, inside the try block, so every IO exception is still converted at this boundary.
+            text = string.Join('\n', LineSource.ReadFileLines(path).ToArray());
         }
         catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
         {
