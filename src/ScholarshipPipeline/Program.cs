@@ -2,13 +2,22 @@ using System.Collections.Immutable;
 using ScholarshipPipeline;
 
 // Imperative shell: the only place that prints and chooses what to do with the FINAL outcome of a Result.
-// Usage: dotnet run --project src/ScholarshipPipeline -- <csv-path> <command>   (run without arguments to see the commands)
+// Usage: dotnet run --project src/ScholarshipPipeline -- <csv-path> <command>   ("help" lists the commands)
+// A plain start without arguments (for example F5 in Visual Studio) runs "rank" on the sample data.
 // Exit codes: 0 = success, 1 = expected domain failure, 2 = operational problem (file) or wrong usage.
+
+if (args.Length == 1 && args[0].ToLowerInvariant() is "help" or "--help" or "-h")
+{
+    Console.WriteLine(UsageText());
+    return 0;
+}
 
 if (args.Length < 1)
 {
-    Console.Error.WriteLine(UsageText());
-    return 2;
+    var sample = DefaultDataPath();
+    Console.WriteLine($"No arguments given: running 'rank' on the sample data ({sample}). Use 'help' to see all commands.");
+    Console.WriteLine();
+    args = [sample, "rank"];
 }
 
 // Final version: readable command names. The names used during Assignments 5-8 (need, merit, both, demo, a7, a8) still work.
@@ -87,8 +96,17 @@ foreach (var (name, policy) in policies)
 return exit;
 
 // ===================================================================================================
+// Sample data for a start without arguments: the data folder of the current directory (dotnet run from the solution
+// folder) or the copy next to the executable (start from Visual Studio). File system check, so it stays in the shell.
+static string DefaultDataPath()
+{
+    var relative = Path.Combine("data", "applications.csv");
+    return File.Exists(relative) ? relative : Path.Combine(AppContext.BaseDirectory, relative);
+}
+
 static string UsageText() => string.Join(Environment.NewLine,
     "Usage: dotnet run --project src/ScholarshipPipeline -- <csv-path> <command>",
+    "       (no arguments: 'rank' on the sample data; 'help': this text)",
     "Commands:",
     "  rank [need|merit|both]                    workflow 1: screen, rank and finalize the round (default: both policies)",
     "  explain <id> [need|merit]                 workflow 2: what happened to one applicant",

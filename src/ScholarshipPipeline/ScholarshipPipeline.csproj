@@ -12,6 +12,11 @@
     <InternalsVisibleTo Include="ScholarshipPipeline.Tests" />
   </ItemGroup>
 
+  <!-- Sample data is copied next to the application, so a start without arguments works from any working directory. -->
+  <ItemGroup>
+    <Content Include="..\..\data\*.csv" Link="data\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <!-- Native library (built from ../../native/scholarship_native.c, see README). The binary for the current OS/architecture
        is copied next to the application, where the runtime resolves DllImport("scholarship_native"). -->
   <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Linux')) And '$([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)' == 'X64'">

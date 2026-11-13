@@ -28,6 +28,9 @@ dotnet run --project src/ScholarshipPipeline -- data/applications.csv explain S0
 dotnet run --project src/ScholarshipPipeline -- data/applications.csv payout academic
 ```
 
+A start without arguments (for example F5 in Visual Studio, or `dotnet run --project src/ScholarshipPipeline`) runs
+`rank` on the sample file `data/applications.csv`. `help` prints the list of commands.
+
 All commands of the application:
 
 | Command | What it does |
@@ -201,7 +204,7 @@ The project was developed step by step through Assignments 5-8 and then integrat
 | Assignment 6 | validated factory, explicit round states, safe transitions |
 | Assignment 7 | `Result`, `Option`, Map / Bind chains, boundary error handling |
 | Assignment 8 | extension methods, LINQ reports, lazy processing, native stipend, export |
-| Final | readable command names, configurable output folder, final README |
+| Final | readable command names, default run on the sample data, configurable output folder, final README |
 
 The detailed notes of every assignment are in [docs/assignments-5-8.md](docs/assignments-5-8.md).
 
