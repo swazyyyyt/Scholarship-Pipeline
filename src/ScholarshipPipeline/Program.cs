@@ -2,14 +2,17 @@ using System.Collections.Immutable;
 using ScholarshipPipeline;
 
 // Imperative shell: the only place that prints and chooses what to do with the FINAL outcome of a Result.
-// Usage: dotnet run --project src/ScholarshipPipeline -- <csv-path> [need|merit|both|demo|a7|a8 [academic|service]|explain <id> [need|merit]]
+// Usage: dotnet run --project src/ScholarshipPipeline -- <csv-path> <command>   (run without arguments to see the commands)
 // Exit codes: 0 = success, 1 = expected domain failure, 2 = operational problem (file) or wrong usage.
 
 if (args.Length < 1)
 {
-    Console.Error.WriteLine("Usage: dotnet run --project src/ScholarshipPipeline -- <csv-path> [need|merit|both|demo|a7|a8 [academic|service]|explain <id> [need|merit]]");
+    Console.Error.WriteLine(UsageText());
     return 2;
 }
+
+// Final version: readable command names. The names used during Assignments 5-8 (need, merit, both, demo, a7, a8) still work.
+args = NormalizeCommand(args);
 
 var path = args[0];
 var mode = args.Length > 1 ? args[1].ToLowerInvariant() : "both";
@@ -18,7 +21,8 @@ var settings = new PipelineSettings(MinGpa: 2.5m, AwardSlots: 3);
 var policies = SelectPolicies(mode switch { "demo" or "a7" or "a8" => "need", "explain" => (args.Length > 3 ? args[3].ToLowerInvariant() : "need"), _ => mode });
 if (policies is null)
 {
-    Console.Error.WriteLine($"Unknown mode or policy '{mode}'. Use need, merit, both, demo, a7 or explain <id> [need|merit].");
+    Console.Error.WriteLine($"Unknown command or policy '{mode}'.");
+    Console.Error.WriteLine(UsageText());
     return 2;
 }
 
@@ -35,7 +39,7 @@ if (mode == "a8")
 {
     var configName = args.Length > 2 ? args[2].ToLowerInvariant() : "academic";
     return Scoring.ByName(configName).Match(
-        score => RunA8Demo(path, configName, score, settings),
+        score => RunA8Demo(path, configName, score, settings, outputDir: args.Length > 3 ? args[3] : "output"),
         () =>
         {
             Console.Error.WriteLine($"Unknown scoring configuration '{configName}'. Use academic or service.");
@@ -83,6 +87,29 @@ foreach (var (name, policy) in policies)
 return exit;
 
 // ===================================================================================================
+static string UsageText() => string.Join(Environment.NewLine,
+    "Usage: dotnet run --project src/ScholarshipPipeline -- <csv-path> <command>",
+    "Commands:",
+    "  rank [need|merit|both]                    workflow 1: screen, rank and finalize the round (default: both policies)",
+    "  explain <id> [need|merit]                 workflow 2: what happened to one applicant",
+    "  payout [academic|service] [output-dir]    workflow 3: both reports, stipends, export to <output-dir>/payouts-<config>.csv",
+    "  sequence                                  demonstration: an invalid operation order is refused",
+    "  errors                                    demonstration: domain failures, lookups and file failures");
+
+// Pure: maps the final command names to the mode names used since the assignments. Unknown names pass through unchanged.
+static string[] NormalizeCommand(string[] args)
+{
+    if (args.Length < 2) return args;
+    return args[1].ToLowerInvariant() switch
+    {
+        "rank" => [args[0], args.Length > 2 ? args[2] : "both"],
+        "sequence" => [args[0], "demo", .. args[2..]],
+        "errors" => [args[0], "a7", .. args[2..]],
+        "payout" => [args[0], "a8", .. args[2..]],
+        _ => args
+    };
+}
+
 static IReadOnlyList<(string Name, Func<ScholarshipApplication, int> Policy)>? SelectPolicies(string mode) =>
     mode switch
     {
@@ -179,11 +206,10 @@ static void RunA7Demo(ApplicationStore store, string csvPath, PipelineSettings s
 }
 
 // Assignment 8 demonstration: configured functions, deferred execution, two reports, native call, export, failure paths.
-static int RunA8Demo(string csvPath, string configName, Func<ScholarshipApplication, int> score, PipelineSettings settings)
+static int RunA8Demo(string csvPath, string configName, Func<ScholarshipApplication, int> score, PipelineSettings settings, string outputDir)
 {
     const int minScore = 60;   // shortlist threshold of report 1
     var dir = Path.GetDirectoryName(csvPath) ?? "";
-    var outputDir = "output";
     Directory.CreateDirectory(outputDir);   // file system work belongs to the shell, not to the pure code
     var exportPath = Path.Combine(outputDir, $"payouts-{configName}.csv");
     var apps = ApplicationLoader.Load(csvPath).Match(a => a, e => throw new InvalidOperationException(e.ToString()));
